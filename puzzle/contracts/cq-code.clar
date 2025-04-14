@@ -1,5 +1,5 @@
-;; Crypto Scavenger Hunt - Version 2
-;; A blockchain-based scavenger hunt with time-based unlocking and enhanced tracking
+;; Crypto Scavenger Hunt
+;; A blockchain-based scavenger hunt with progressive puzzles and rewards
 
 ;; Constants
 (define-constant ERR-NOT-AUTHORIZED (err u1))
@@ -9,6 +9,9 @@
 (define-constant ERR-WRONG-SOLUTION (err u5))
 (define-constant ERR-TIME-LOCKED (err u6))
 (define-constant ERR-INSUFFICIENT-PAYMENT (err u7))
+(define-constant ERR-INVALID-PARAMETER (err u8))
+(define-constant ERR-STAGE-EXISTS (err u9))
+(define-constant MAX-STAGE-ID u100) ;; Maximum allowed stage ID
 
 ;; Data Variables
 (define-data-var admin principal tx-sender)
@@ -16,15 +19,15 @@
 (define-data-var current-stage uint u0)
 (define-data-var entry-fee uint u1000000) ;; 1 STX
 (define-data-var total-prize-pool uint u0)
-(define-data-var current-timestamp uint u0) ;; Timestamp tracking
+(define-data-var current-timestamp uint u0) ;; New timestamp tracking instead of block-height
 
 ;; Hunt Stage Structure
 (define-map hunt-stages
     uint
     {
         clue: (string-utf8 256),
-        solution-hash: (buff 32),
-        unlock-time: uint,
+        solution-hash: (buff 32), ;; SHA256 hash of the solution
+        unlock-time: uint,        ;; Changed from unlock-height to unlock-time
         prize: uint,
         solved: bool
     }
@@ -64,7 +67,8 @@
 (define-public (update-timestamp (new-timestamp uint))
     (begin
         (asserts! (is-admin) ERR-NOT-AUTHORIZED)
-        (asserts! (>= new-timestamp (var-get current-timestamp)) ERR-TIME-LOCKED)
+        ;; Validate timestamp is not in the past
+        (asserts! (>= new-timestamp (var-get current-timestamp)) ERR-INVALID-PARAMETER)
         (var-set current-timestamp new-timestamp)
         (ok true)))
 
@@ -86,6 +90,24 @@
     (begin
         (asserts! (is-admin) ERR-NOT-AUTHORIZED)
         
+        ;; Validate stage-id is within acceptable range
+        (asserts! (<= stage-id MAX-STAGE-ID) ERR-INVALID-PARAMETER)
+        
+        ;; Check if stage already exists to prevent overwriting
+        (asserts! (is-none (map-get? hunt-stages stage-id)) ERR-STAGE-EXISTS)
+        
+        ;; Validate unlock time is in the future
+        (asserts! (>= unlock-time (var-get current-timestamp)) ERR-INVALID-PARAMETER)
+        
+        ;; Validate solution hash is not empty
+        (asserts! (> (len solution-hash) u0) ERR-INVALID-PARAMETER)
+        
+        ;; Validate clue is not empty
+        (asserts! (> (len clue) u0) ERR-INVALID-PARAMETER)
+        
+        ;; Validate prize is a positive amount
+        (asserts! (> prize u0) ERR-INVALID-PARAMETER)
+        
         ;; Set the stage data
         (map-set hunt-stages stage-id
             {
@@ -96,8 +118,12 @@
                 solved: false
             })
             
-        ;; Update prize pool
-        (var-set total-prize-pool (+ (var-get total-prize-pool) prize))
+        ;; Calculate new prize pool safely
+        (let ((new-prize-pool (+ (var-get total-prize-pool) prize)))
+            ;; Make sure the addition doesn't overflow
+            (asserts! (>= new-prize-pool (var-get total-prize-pool)) ERR-INVALID-PARAMETER)
+            ;; Update the total prize pool
+            (var-set total-prize-pool new-prize-pool))
         (ok true)))
 
 ;; Player Registration
@@ -130,7 +156,7 @@
         (asserts! (>= current-time (get unlock-time stage)) ERR-TIME-LOCKED)
         (asserts! (not (get solved stage)) ERR-ALREADY-SOLVED)
         
-        ;; Verify solution
+        ;; Verify solution - directly compare the hashes
         (if (is-eq solution (get solution-hash stage))
             (begin
                 ;; Update stage status
@@ -144,7 +170,6 @@
                         solved-stages: (unwrap! (as-max-len? 
                             (append (get solved-stages player) stage-id) u20)
                             ERR-INVALID-STAGE),
-                        last-attempt: current-time,
                         total-solved: (+ (get total-solved player) u1)
                     }))
                 
@@ -170,18 +195,7 @@
                         (list {player: tx-sender, solved-at: current-time})))
                 
                 (ok true))
-            (begin
-                ;; Record failed attempt
-                (let ((solution-record (default-to 
-                        {attempts: u0, solved-at: none}
-                        (map-get? stage-solutions {stage: stage-id, player: tx-sender}))))
-                    (map-set stage-solutions
-                        {stage: stage-id, player: tx-sender}
-                        (merge solution-record {attempts: (+ (get attempts solution-record) u1)}))
-                    ;; Update player's last attempt timestamp
-                    (map-set player-progress tx-sender
-                        (merge player {last-attempt: current-time})))
-                ERR-WRONG-SOLUTION))))
+            ERR-WRONG-SOLUTION)))
 
 ;; Read-only functions
 (define-read-only (get-current-clue (stage-id uint))
@@ -208,6 +222,3 @@
         entry-fee: (var-get entry-fee),
         current-time: (var-get current-timestamp)
     })
-
-(define-read-only (get-player-attempts (stage-id uint) (player principal))
-    (map-get? stage-solutions {stage: stage-id, player: player}))
